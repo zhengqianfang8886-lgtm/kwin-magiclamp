@@ -1,0 +1,182 @@
+Snap Layouts Manager — KDE Plasma 6 完整开发规格书
+1. 项目定位与总体架构
+开发一套运行在 KDE Plasma 6（Wayland 优先，兼容 X11） 下的纯浮动窗口排版增强工具，由两部分组成：
+主脚本 kwin_snap_layouts（KWin Declarative QML Script）：负责拖拽监听、顶部浮动排版条、屏幕边缘吸附、拖动/缩放参考线、拖出恢复原尺寸、应用最佳尺寸配置、可视化调节面板、全局快捷键与 JSON 配置持久化。
+伴生滑行特效 kwin4_effect_snap_glide（KWin JavaScript Effect）：负责当脚本（或快捷键）瞬间改变窗口几何尺寸时，提供丝滑的平移 + 缩放动画。
+目录结构规范
+Text
+kwin_snap_layouts/
+├── metadata.json                         # KWin/Script 元数据 (X-Plasma-API: declarativescript)
+├── contents/
+│   ├── code/
+│   │   ├── defaults.js                   # 默认配置与版本迁移逻辑
+│   │   ├── layoutEngine.js               # 排版模板计算、顶部条几何命中、边缘吸附、移动/缩放磁吸算法
+│   │   ├── windowTracker.js              # 窗口贴靠前原始尺寸记忆与拖出恢复追踪
+│   │   └── appProfiles.js                # 应用识别、内置分类比例、最佳尺寸目标计算
+│   ├── config/
+│   │   └── main.xml                      # KConfig 占位说明
+│   └── ui/
+│       ├── main.qml                      # 入口逻辑、窗口生命周期监听、快捷键注册、防崩兜底
+│       ├── DragOverlay.qml               # 【关键】唯一合并拖拽遮罩层（参考线 + 预览框 + 顶部排版条）
+│       ├── LayoutCard.qml                # 排版卡片缩略预览组件
+│       ├── LayoutEditor.qml              # 独立可视化设置面板 (720×580)
+│       └── config.ui                     # KCM 脚本设置页提示文本
+├── effects/
+│   └── kwin4_effect_snap_glide/
+│       ├── metadata.json                 # KWin/Effect 元数据
+│       └── contents/code/main.js         # 伴生滑行动画脚本
+└── tools/
+    └── dev_sync.py                       # 一键部署到 ~/.local/share/kwin/ 并无缓存热重载
+2. 核心功能规格（必须 100% 一致）
+2.1 顶部浮动排版条（Top Snap Bar）
+触发条件：仅在用户**拖动窗口移动（Move，非 Resize）**时，若光标进入顶部热区：
+cursor.y <= area.y + topTriggerHeight（默认 34px）
+且水平方向 area.x + 80 <= cursor.x <= area.x + area.width - 80
+自动收起：当 cursor.y > barY + barH + 36 时平滑淡出隐藏。
+尺寸与布局：
+排版卡片：cardW = 104, cardH = 62, cardSpacing = 10, 外边距 padX = 12, padY = 10, 卡片内边距 innerCardPad = 5, 格子内缝 innerZoneGap = 3。
+排版条水平居中显示在当前屏幕可用工作区顶部：barY = area.y + barOffsetY（默认 18）。
+卡片右侧依次固定排列 3 个工具格（高度均为 62，间距 toolGap = 8）：
+✦ 最佳（bestPill，宽 54，珊瑚粉 #FB7185）：
+悬停：屏幕预览当前应用的最佳目标矩形。
+松手：退出最大化（如有），清除“拖出恢复记录”，将窗口居中调整为最佳尺寸。
+✓ 定最佳（setBestPill，宽 54，翡翠绿 #34D399）：
+悬停：屏幕预览窗口的 startGeom（提示松手后会弹回原位保持当前尺寸）。
+松手：将拖拽前窗口宽高 oldStart 占当前屏幕可用区的比例静默保存为该应用的 appProfiles[appKey]，并将窗口弹回 oldStart 原位（不改变窗口大小）。
+⚙ 调节（editPill，宽 46，天蓝 #38BDF8）：
+悬停：不显示预览框。
+松手：窗口弹回 oldStart 原位，并打开 LayoutEditor 设置面板。
+2.2 排版模板引擎（7 种模板，默认启用前 6 种）
+可用区 ux = area.x + screenGap, uy = area.y + screenGap, uw = area.width - 2*screenGap, uh = area.height - 2*screenGap。非 noInnerGap 的区域相邻内侧各缩半个 gap：
+cols-2（左右双栏）：splits: { ratio: 0.50 }（限制 0.2~0.8）
+left-right-2（左主右二）：splits: { ratioX: 0.55, ratioY: 0.50 }
+right-left-2（左二右主）：splits: { ratioX: 0.45, ratioY: 0.50 }（可通过调节面板 +左二右主 添加）
+cols-3（三栏排版）：splits: { r1: 0.25, r2: 0.75 }（r1: 0.15~0.70, r2 >= r1+0.15 ~ 0.85）
+grid-2x2（四宫格）：splits: { ratioX: 0.50, ratioY: 0.50 }
+top-bottom-2（上主下二）：splits: { ratioY: 0.58, ratioX: 0.50 }
+center-focus（居中专注）：splits: { widthRatio: 0.72, heightRatio: 0.88 }（noInnerGap: true，0.4~0.96）
+2.3 屏幕边缘与四角快捷贴靠（Edge & Corner Snap）
+当 edgeSnapEnabled = true 且未命中顶部排版条时生效（edgeThreshold = 14, corner = 46）：
+左边 + 顶角（y <= area.y + 46）→ 左上 1/4 屏
+左边 + 底角（y >= area.y + area.height - 46）→ 左下 1/4 屏
+右边 + 顶角 → 右上 1/4 屏
+右边 + 底角 → 右下 1/4 屏
+仅左边缘 → 左半屏 1/2
+仅右边缘 → 右半屏 1/2
+底边缘最左 25% → 左下 1/4 屏；底边缘最右 25% → 右下 1/4 屏
+悬停时显示蓝色半透明预览框（#2B38BDF8 / 边框 #D938BDF8），松手应用并记录拖拽前原始尺寸。
+2.4 拖出自动恢复原本尺寸（Restore on Drag Out）
+窗口贴靠到分屏区域或屏幕边缘时，调用 tracker.saveBeforeSnap(client, oldStart) 记录贴靠前的 preSnapRect 并标记 snapped = true（连续在不同分屏区间切换时不覆盖最初的 preSnapRect）。
+当 restoreOnDragOut = true 且把已贴靠窗口直接拖出到普通浮动区松手时：
+恢复为 preSnapRect 的宽高；
+水平居中对齐鼠标释放位置（cx - width/2 并限制在当前工作区内），垂直坐标限制在工作区内；
+解除最大化并叠加磁吸对齐计算。
+窗口关闭时从 tracker 移除。
+2.5 拖动与改大小软参考线 & 磁吸对齐（Soft Guides）
+支持**拖动位置（computeAxisSnap）和拖拽改大小（computeResizeSnap）**两种模式；拖拽期间仅显示辅助线与虚实线幽灵预览框（带四角 L 形角标），松手瞬间才把窗口吸附到位。
+拖动对齐优先级（X 轴与 Y 轴各自独立判定）：
+探测点：若 triggerByCursor = true 则用鼠标指针坐标，否则用窗口中心坐标。
+居中轴线：默认 V 轴 50% / 33.3% / 66.7%，H 轴 50% / 33.3% / 66.7%（可自由增删开关调节比例），识别半径 centerSnapRadius = 36px；命中时将窗口中心对齐该轴线。
+同屏其他正常窗口中心：snapToWindowCenters = true，半径 max(18, round(centerSnapRadius * 0.78))。
+屏幕四边 & 其他窗口边缘/Gap 间距：snapToScreenEdges = true, snapToWindowEdges = true，识别半径 edgeSnapRadius = 18px；除对齐对方四边外，还包含 og - gap 与 og + og.size + gap 的缝隙对齐。
+改大小对齐（computeResizeSnap）：
+根据 startGeom 比对哪些边正在移动（差值 > 1px）；
+仅对正在移动的边吸附屏幕四边、启用的 V/H 轴线、其他窗口边缘及 gap 间距边（最小宽 120px、最小高 100px）。
+极简隐形模式与视觉配色：
+showIdleGuides = false（默认）：平时不画未命中的淡线，只有命中时才亮起。
+guideBgDim = 0.0（默认）：不压暗全屏背景（面板可调 0% ~ 70%）。
+4 套轴线配色：coral（#FB7185）、violet（#C084FC）、emerald（#34D399）、cyan（#38BDF8）；屏幕边缘用 #2DD4BF（翡翠主题下 #38BDF8）；窗口边缘/Gap 用 #FBBF24。
+命中线效果：外层光晕（thickness + 10）+ 中心主色线（thickness 默认 4px）+ 1px 白色高光芯 + 顶部/左侧胶囊文字标签 + V/H 双轴同时命中时交叉点光环。
+2.6 最佳尺寸系统（无悬浮胶囊、纯静默/按需设计）
+绝对不要任何自动弹出或长驻屏幕的推荐提示小胶囊。
+应用识别（appProfiles.js）：
+取 resourceClass || resourceName 小写作为 appKey；显示名去掉 .desktop 和反域名（如 org.kde.dolphin → Dolphin）。
+忽略列表：plasmashell, kwin_wayland, kwin_x11, krunner, xwaylandvideobridge, polkit-kde-authentication-agent-1, kwin 系统弹窗。
+内置分类推荐比例（无自定义记录时兜底）：
+终端类（konsole|alacritty|kitty|wezterm|gnome-terminal|foot|xterm|yakuake|tilix|ghostty）：0.42 × 0.72
+文件管理（dolphin|nautilus|thunar|nemo|pcmanfm|krusader）：0.54 × 0.70
+浏览器（firefox|chromium|chrome|brave|edge|vivaldi|zen|opera）：0.78 × 0.90
+开发工具（code|codium|cursor|zed|jetbrains|idea|pycharm|clion|kate|kdevelop|neovide|sublime）：0.80 × 0.90
+文档笔记（obsidian|notion|typora|logseq|okular|wps|libreoffice）：0.66 × 0.86
+通讯媒体（telegram|wechat|weixin|qq|discord|slack|feishu|spotify|yesplaymusic）：0.48 × 0.76
+系统工具（systemsettings|kinfocenter|gwenview|ark|spectacle）：0.52 × 0.74
+其他窗口兜底：0.62 × 0.82
+使用方式：
+顶部排版条 ✦ 最佳：拖入直接套用最佳尺寸。
+顶部排版条 ✓ 定最佳：拖入静默记住当前宽高比例并弹回原位。
+快捷键 Meta + B：直接把当前活动窗口居中调整为最佳尺寸（无弹窗）。
+快捷键 Meta + Shift + B：静默记住当前活动窗口宽高比例为最佳尺寸（无弹窗）。
+2.7 可视化调节面板（LayoutEditor）
+无边框圆角浮动面板（720×580，背景 #F2131720），顶部标题栏整条可拖移（限制在当前屏幕内），右上角 ✕ 及 Esc 关闭。
+两个页签：
+顶部排版条：左侧排版列表（勾选启用/禁用、删除 ×、底部 +双栏 +三栏 +左二右主 按钮）；右侧实时预览卡片 + 当前模板分割比例滑块 + Gap（024px）、Screen Gap（024px）、顶部条下移距离（6~80px）、边缘/四角贴靠、拖出恢复原本尺寸。
+居中参考线：开启参考线、常驻显示淡参考线、4 种配色选择、线粗（210px）、居中识别半径（1280px）、按鼠标/按窗口中心切换、背景变暗（0~70%）、屏幕四边/窗口中心/窗口边缘开关、垂直轴列表（可勾选/滑块调比例/删除/添加）、水平轴列表。
+底部栏：恢复默认（左）、自动实时保存提示（中）、完成（右）。
+滚轮与滚动条：自定义 WheelScroller 捕获滚轮驱动 Flickable，右侧带柔和滚动条指示器。
+2.8 全局快捷键与配置持久化
+快捷键：
+Meta+Shift+Z：打开/关闭可视化调节面板
+Meta+Shift+G：开关居中参考线
+Meta+B：直接应用当前窗口最佳大小（无弹窗）
+Meta+Shift+B：静默记住当前窗口为最佳大小（无弹窗）
+配置文件路径：~/.config/kwin_snap_layouts.json（400ms 防抖异步写入）。
+2.9 伴生滑行特效（kwin4_effect_snap_glide）
+纯移动：210ms，QEasingCurve.OutExpo，仅 Effect.Translation。
+含尺寸变化（dw >= 4 || dh >= 4）：155ms，QEasingCurve.OutCubic，同时做 Effect.Translation + Effect.Scale。
+严格过滤条件（避免闪烁和标签页撕裂bug）：
+忽略 internal / deleted / !managed / !visible / !normalWindow / minimized / desktopWindow / dock / specialWindow / popupWindow / tooltip / notification / onScreenDisplay / outline；
+忽略 kwin / plasmashell / krunner / xwaylandvideobridge；
+600ms 新生窗口保护期（windowAdded 后 600ms 内不做动画）；
+用户正在拖拽中不触发动画；
+最大化状态变化后 150ms 内不重复叠加动画；
+忽略宽高 < 80px、位移 < 6px && 尺寸变化 < 8px、缩放比超出 [0.25, 4.0] 的异常跳变。
+3. 血泪总结：Wayland 防崩溃与稳定性铁律（AI 开发必须遵守）
+在 kwin_wayland 环境下，KWin 脚本直接运行在合成器主进程内。为了彻底避免 QOpenGLContext::shareGroup() / QOpenGLFramebufferObject: Framebuffer incomplete 等致命段错误，必须严格遵守以下 5 条架构约束：
+所有拖拽期间的视觉元素必须合并进唯一一个 DragOverlay 窗口：
+禁止把顶部排版条、预览高亮框、参考线拆成 3 个独立的 Dialog / Window 在拖拽过程中高频开关 visible。
+拖拽开始（onDragStart）时显示这 1 个遮罩窗；整个拖拽过程（onDragStep）中保持 visible = true 不变，仅通过修改内部 QML 元素的 opacity 控制显隐；拖拽结束后延迟 ~170ms（等渐隐动画结束）再把 visible 设为 false。
+绝不在 visible === true 时改变顶层覆盖窗的宽高：
+必须先更新 screenRect 和 x, y，再设 visible = true。如果拖拽跨过不同分辨率的屏幕，先 visible = false 再 Qt.callLater 重开。
+不要把 Timer 等非 QQuickItem 对象直接放在 PlasmaCore.Dialog 顶层：
+PlasmaCore.Dialog 默认属性是 mainItem（类型为 QQuickItem*），所有 Timer 必须放在 mainItem: Item { ... } 内部。
+不要在高频移动回调中读取未注册元类型的属性：
+每次读取都必须确保属性已注册，避免 QMetaProperty::read: Unable to handle unregistered datatype 刷屏卡顿。
+三层拖拽结束兜底 + 600ms 新生窗口保护：
+除监听拖拽结束信号外，在 step 回调和窗口 move/resize 状态变更信号中检查：若底层已结束移动/缩放，立刻触发 onDragFinish；所有外部窗口回调一律包裹 try/catch 并校验窗口存活。
+4. KDE Plasma 5 → KDE Plasma 6（Qt 6 / KWin 6）迁移对照清单
+给 AI 编写 Plasma 6 版本时，必须将原 Plasma 5 代码按下列 API 差异完成升级：
+模块 / 概念	Plasma 5 (Qt 5) 原实现	Plasma 6 (Qt 6 / KWin 6) 对应写法
+QML 导入语法	import QtQuick 2.15
+import org.kde.kwin 2.0 as KWin	import QtQuick
+import org.kde.kwin（或 3.0，不写版本号通常即可）
+窗口列表与生命周期信号	ws.clientList()
+ws.clientAdded / ws.clientRemoved
+ws.clientActivated	ws.windowList()[1]
+ws.windowAdded / ws.windowRemoved
+ws.windowActivated
+用户拖拽开始/步进/结束信号	c.clientStartUserMovedResized
+c.clientStepUserMovedResized
+c.clientFinishUserMovedResized	c.interactiveMoveResizeStarted
+c.interactiveMoveResizeStepped(geometry)
+c.interactiveMoveResizeFinished[2]
+工作区与屏幕属性	c.screen (int)
+ws.clientArea(opt, c)	KWin 6 中 KWin::Output* 已正式注册到 QML (c.output / workspace.screens / workspace.activeScreen)，可直接用 c.output === o.output 判断同屏[3][4]；ws.clientArea(KWin.PlacementArea, c) 或 (opt, c.output, ws.currentDesktop) 均可
+虚拟桌面属性	c.desktop (int)
+ws.currentDesktop (int)	c.desktops（QList<KWin::VirtualDesktop*>，判断长度是否为 0 或是否包含 ws.currentDesktop）[4]
+c.onAllDesktops 仍有效
+可执行数据源 (读写 JSON)	import org.kde.plasma.core 2.0 as PlasmaCore
+PlasmaCore.DataSource	import org.kde.plasma.plasma5support as Plasma5Support
+Plasma5Support.DataSource[5]（或改用 Qt6 XMLHttpRequest/File IO 或保留 Plasma5Support.DataSource 执行读写命令）
+OSD 悬浮窗组件	PlasmaCore.Dialog (OnScreenDisplay, outputOnly: true)	import org.kde.plasma.core as PlasmaCore，PlasmaCore.Dialog 在 Plasma 6 仍保留可用[6]；若需更现代的 Wayland 原生方案，也可评估使用 Window + LayerShellQt.Window（LayerOverlay）替代，但需验证 kwin_wayland 脚本内鼠标穿透 (WindowTransparentForInput) 行为
+窗口设置与布局	c.setMaximize(false, false)
+c.frameGeometry = Qt.rect(...)	同理（frameGeometry 为 QRectF，注意 Math.round 取整以避免分数缩放模糊）[7]
+Metadata 与工具命令	ServiceTypes: ["KWin/Script"]
+kwriteconfig5 / qdbus	清理废弃 Plasma 5 ServiceTypes 字段（保留 KPackageStructure: "KWin/Script" 与 "KWin/Effect"）；脚本配置写入改用 kwriteconfig6（或兼容探测 kwriteconfig6 / kwriteconfig5），D-Bus 探测 qdbus6 / qdbus / gdbus
+伴生 JS Effect (glide)	effects.windowFrameGeometryChanged, windowStartUserMovedResized, windowFinishUserMovedResized	KWin 6 Effect API 信号名基本一致（effects.windowAdded, windowFrameGeometryChanged(w, oldGeometry), windowStartUserMovedResized, windowFinishUserMovedResized, windowMaximizedStateChanged, windowClosed, windowDeleted）[8]，注意检查 Effect metadata.json 按 KWin 6 KPackageStructure: "KWin/Effect" 规范编写
+5. 给未来 AI 的开场提示词（可直接复制使用）
+以后你要让 AI 写 KDE 6 版本时，把上面整篇文档连同下面这句话一起发给它即可：
+请严格按照上述规格书，为 KDE Plasma 6（Qt 6 / KWin 6 / Wayland） 从零实现完整可运行的 kwin_snap_layouts、kwin4_effect_snap_glide 以及 tools/dev_sync.py。
+要求：
+所有功能、快捷键、交互细节、默认值与 UI 布局与规格书 100% 一致；
+严格遵守第 3 节的所有防崩约束（单窗口 DragOverlay、禁止拖拽中开关 visible、禁止运行时 resize 窗口、Timer 放进 mainItem 内）；
+严格按照第 4 节适配 Plasma 6 / KWin 6 的 API（windowList()、interactiveMoveResizeStarted/Stepped/Finished、desktops、output、Plasma5Support.DataSource 等），不要混用任何 Plasma 5 废弃 API。
